@@ -13,6 +13,8 @@ import time
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import contextmanager, nullcontext
+import datetime
+import random
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -20,12 +22,12 @@ from ldm.models.diffusion.plms import PLMSSampler
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
-
+from PIL.PngImagePlugin import PngInfo
 
 # load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+#safety_model_id = "CompVis/stable-diffusion-safety-checker"
+#safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+#safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
 
 def chunk(it, size):
@@ -60,7 +62,6 @@ def load_model_from_config(config, ckpt, verbose=False):
         print("unexpected keys:")
         print(u)
 
-    model.cuda()
     model.eval()
     return model
 
@@ -96,7 +97,8 @@ def check_safety(x_image):
 
 def main():
     parser = argparse.ArgumentParser()
-
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d')
+    
     parser.add_argument(
         "--prompt",
         type=str,
@@ -109,7 +111,7 @@ def main():
         type=str,
         nargs="?",
         help="dir to write results to",
-        default="outputs/txt2img-samples"
+        default="outputs/txt2img-samples/" 
     )
     parser.add_argument(
         "--skip_grid",
@@ -216,7 +218,7 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=random.randint(0,4294967295),
         help="the seed (for reproducible sampling)",
     )
     parser.add_argument(
@@ -225,6 +227,13 @@ def main():
         help="evaluate at this precision",
         choices=["full", "autocast"],
         default="autocast"
+    )
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        nargs="?",
+        default="",
+        help="the negative prompt to render"
     )
     opt = parser.parse_args()
 
@@ -235,11 +244,12 @@ def main():
         opt.outdir = "outputs/txt2img-samples-laion400m"
 
     seed_everything(opt.seed)
+   
 
     config = OmegaConf.load(f"{opt.config}")
     model = load_model_from_config(config, f"{opt.ckpt}")
 
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cpu")
     model = model.to(device)
 
     if opt.plms:
@@ -251,9 +261,9 @@ def main():
     outpath = opt.outdir
 
     print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    wm = "StableDiffusionV1"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+    #wm = "StableDiffusionV1"
+    #wm_encoder = WatermarkEncoder()
+    #wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
@@ -268,12 +278,13 @@ def main():
             data = f.read().splitlines()
             data = list(chunk(data, batch_size))
 
-    sample_path = os.path.join(outpath, "samples")
+    sample_path = os.path.join(outpath, timestamp)
     os.makedirs(sample_path, exist_ok=True)
     base_count = len(os.listdir(sample_path))
     grid_count = len(os.listdir(outpath)) - 1
 
     start_code = None
+    
     if opt.fixed_code:
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
@@ -286,8 +297,10 @@ def main():
                 for n in trange(opt.n_iter, desc="Sampling"):
                     for prompts in tqdm(data, desc="data"):
                         uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
+                        if len(opt.negative_prompt) > 1:
+                            uc = model.get_learned_conditioning( len(prompts) * [opt.negative_prompt])
+                        elif opt.scale != 1.0:
+                            uc = model.get_learned_conditioning(batch_size * [""])    
                         if isinstance(prompts, tuple):
                             prompts = list(prompts)
                         c = model.get_learned_conditioning(prompts)
@@ -306,7 +319,7 @@ def main():
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                        x_checked_image = x_samples_ddim
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
@@ -314,8 +327,18 @@ def main():
                             for x_sample in x_checked_image_torch:
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                                 img = Image.fromarray(x_sample.astype(np.uint8))
-                                img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                                #img = put_watermark(img, wm_encoder)
+                                metadata = PngInfo()
+                                metadata.add_text("Prompt", opt.prompt)
+                                metadata.add_text("NegativePrompt",opt.negative_prompt)
+                                if opt.plms:
+                                    metadata.add_text("sampler","plms")
+                                else:
+                                    metadata.add_text("sampler","ddims")
+                                currentseed = torch.initial_seed() 
+                                metadata.add_text("seed",str(currentseed))
+                                metadata.add_text("promptseed",str(opt.seed))
+                                img.save(os.path.join(sample_path, f"{base_count:05}.png"),  pnginfo=metadata)
                                 base_count += 1
 
                         if not opt.skip_grid:
@@ -330,14 +353,12 @@ def main():
                     # to image
                     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
                     img = Image.fromarray(grid.astype(np.uint8))
-                    img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                    #img = put_watermark(img, wm_encoder)
+                    img.save(os.path.join(outpath, f'{timestamp}{grid_count:04}.png'))
                     grid_count += 1
-
                 toc = time.time()
 
-    print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-          f" \nEnjoy.")
+    print(f"Your samples are ready and waiting for you here: \n{outpath} \n\nEnjoy.")
 
 
 if __name__ == "__main__":
